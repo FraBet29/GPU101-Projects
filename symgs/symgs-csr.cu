@@ -160,7 +160,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 // Parallel reduction
 __global__ void reduction(const int *col_ind, const float *values, const float *x, float *red, const int row_start, const int row_end)
 {
-    extern __shared__ float sum[]; // Array of size blockDim.x
+    extern __shared__ float sum[]; // Array of size blockDim.x (i.e. threads_per_block)
 
     unsigned int i = threadIdx.x; // Local thread ID
     unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x; // Global thread ID (potentially ranging from 0 to num_rows)
@@ -194,6 +194,9 @@ __global__ void reduction(const int *col_ind, const float *values, const float *
 void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, const int num_vals)
 {   
 
+    printf("Number of rows: %d\n", num_rows);
+    printf("Number of values: %d\n", num_vals);
+
     int *d_col_ind;
     float *d_values, *d_x;
 
@@ -205,10 +208,13 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
     check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // We will need to update x at each iteration
 
     // CUDA kernel parameters
-    unsigned int threads_per_block = 256;
+    unsigned int threads_per_block = 64;
     unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block; // The GPU processes at most row_values values per iteration (worst case)
 
+    printf("Number of blocks and threads per block: %d, %d\n", num_blocks, threads_per_block);
+
     // Allocate arrays to perform reduction (each element will contain the result computed by one GPU block)
+    // The number of blocks effectively needed varies at each iteration, here we consider the worst case to perform one memory allocation once for all
     float *h_red = (float *)malloc(num_blocks * sizeof(float));
     float *d_red;
 
@@ -222,8 +228,12 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
+        printf("Processing values from %dth to %dth\n", row_start, row_end);
+
         // Compute the number of blocks effectively needed
         unsigned int num_blocks_eff = ((row_end - row_start) + threads_per_block - 1) / threads_per_block;
+
+        printf("Number of blocks effectively needed: %d\n", num_blocks_eff);
 
         reduction<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(d_col_ind, d_values, d_x, d_red, row_start, row_end);
         check_kernel_call();
@@ -352,8 +362,8 @@ int main(int argc, const char *argv[])
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
-    printf("x: %f %f %f %f\n", x[0], x[1], x[2], x[3]);
-    printf("x par: %f %f %f %f\n", x_par[0], x_par[1], x_par[2], x_par[3]);
+    printf("x: %f %f %f %f %f\n", x[0], x[1], x[2], x[3], x[4]);
+    printf("x par: %f %f %f %f %f\n", x_par[0], x_par[1], x_par[2], x_par[3], x_par[4]);
 
     // Compare results
     float err = inf_err(x, x_par, num_rows);
