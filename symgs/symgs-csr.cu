@@ -8,7 +8,7 @@
 {                                                            \
   const cudaError_t err = call;                              \
   if (err != cudaSuccess) {                                  \
-    printf("%offset in %offset at line %d\n", cudaGetErrorString(err), \
+    printf("%s in %s at line %d\n", cudaGetErrorString(err), \
                                     __FILE__, __LINE__);     \
     exit(EXIT_FAILURE);                                      \
   }                                                          \
@@ -18,7 +18,7 @@
 {                                                            \
   const cudaError_t err = cudaGetLastError();                \
   if (err != cudaSuccess) {                                  \
-    printf("%offset in %offset at line %d\n", cudaGetErrorString(err), \
+    printf("%s in %s at line %d\n", cudaGetErrorString(err), \
                                     __FILE__, __LINE__);     \
     exit(EXIT_FAILURE);                                      \
   }                                                          \
@@ -34,7 +34,7 @@ double get_time() // function to get the time of day in seconds
 // Reads a sparse matrix and represents it using CSR (Compressed Sparse Row) format
 void read_matrix(int **row_ptr, int **col_ind, float **values, float **matrixDiagonal, const char *filename, int *num_rows, int *num_cols, int *num_vals)
 {
-    int err;
+    //int err;
     FILE *file = fopen(filename, "r");
     if (file == NULL)
     {
@@ -158,22 +158,35 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 }
 
 // Parallel reduction
-__global__ void reduction(const int *col_ind, const float *values, const float *x, float *sum, const int row_start, const int row_end)
+__global__ void reduction(const int *col_ind, const float *values, const float *x, float *red, const int row_start, const int row_end)
 {
-    unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    extern __shared__ float sum[]; // Array of size blockDim.x
 
-    if(tid < row_end - row_start) // use only the memory that is needed
+    unsigned int i = threadIdx.x; // Local thread ID
+    unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x; // Global thread ID (potentially ranging from 0 to num_rows)
+
+    if(tid > row_start && tid < row_end)
     {
-        sum[tid] = values[row_start + tid] * x[col_ind[row_start + tid]];
+        sum[i] = values[tid] * x[col_ind[tid]]; // Compute all the values to be added
+    }
+    else
+    {
+        sum[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+	  {	
+		    if(i < s)
+        {
+			      sum[i] += sum[i + s];
+		    }
+		    __syncthreads();
     }
 
-    for(unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1)
-	{	
-		if (tid < offset)
-        {
-			sum[tid] += sum[tid + offset];
-		}
-		__syncthreads();
+    if(i == 0)
+    {
+        red[blockIdx.x] = sum[0];
     }
 }
 
@@ -182,28 +195,24 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
 {   
 
     int *d_col_ind;
-    float *d_values;
+    float *d_values, *d_x;
 
-    // Allocate memory on the GPU once for all (even though we may be wasting some space)
     check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
     check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
     check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
-
-    float *d_x;
-    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
     check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // We will need to update x at each iteration
 
-    float *d_sum;
-    float sum_temp;
-
-    // Allocate memory for the array used to perform the reduction on the GPU
-    check_call(cudaMalloc((void**)&d_sum, num_vals * sizeof(float)));
-
     // CUDA kernel parameters
-    unsigned int N = 256; // N <= 1024
-    dim3 threads_per_block(N, 1, 1);
-    dim3 num_blocks((num_rows + N - 1) / N, 1, 1); // The GPU processes at most num_rows values per iteration
+    unsigned int threads_per_block = 256;
+    unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block; // The GPU processes at most row_values values per iteration (worst case)
+
+    // Allocate arrays to perform reduction (each element will contain the result computed by one GPU block)
+    float *h_red = (float *)malloc(num_blocks * sizeof(float));
+    float *d_red;
+
+    check_call(cudaMalloc((void**)&d_red, num_blocks * sizeof(float)));
 
     // Forward sweep
     for (int i = 0; i < num_rows; i++)
@@ -213,18 +222,27 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        reduction<<<num_blocks, threads_per_block>>>(d_col_ind, d_values, d_x, d_sum, row_start, row_end);
+        // Compute the number of blocks effectively needed
+        unsigned int num_blocks_eff = ((row_end - row_start) + threads_per_block - 1) / threads_per_block;
+
+        reduction<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(d_col_ind, d_values, d_x, d_red, row_start, row_end);
         check_kernel_call();
         cudaDeviceSynchronize();
 
-        check_call(cudaMemcpy(&sum_temp, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
-        sum -= sum_temp;
+        // Copy the elements which have been effectively processed
+        check_call(cudaMemcpy(h_red, d_red, num_blocks_eff * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // Complete reduction
+        for(int j = 0; j < num_blocks_eff; ++j)
+        {
+            sum -= h_red[j];
+        }
 
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
 
-        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update the current value
+        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update current x
     }
 
     // Backward sweep
@@ -235,25 +253,34 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+        // Compute the number of blocks effectively needed
+        unsigned int num_blocks_eff = ((row_end - row_start) + threads_per_block - 1) / threads_per_block;
 
-        reduction<<<num_blocks, threads_per_block>>>(d_col_ind, d_values, d_x, d_sum, row_start, row_end);
+        reduction<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(d_col_ind, d_values, d_x, d_red, row_start, row_end);
         check_kernel_call();
         cudaDeviceSynchronize();
 
-        check_call(cudaMemcpy(&sum_temp, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
-        sum -= sum_temp;
+        // Copy the elements which have been effectively processed
+        check_call(cudaMemcpy(h_red, d_red, num_blocks_eff * sizeof(float), cudaMemcpyDeviceToHost));
 
+        // Complete reduction
+        for(int j = 0; j < num_blocks_eff; ++j)
+        {
+            sum -= h_red[j];
+        }
+        
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
 
-        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update the current value
+        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update current x
     }
 
+    free(h_red);
     check_call(cudaFree(d_col_ind));
     check_call(cudaFree(d_values));
     check_call(cudaFree(d_x));
+    check_call(cudaFree(d_red));
 
 }
 
@@ -325,8 +352,12 @@ int main(int argc, const char *argv[])
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
+    printf("x: %f %f %f %f\n", x[0], x[1], x[2], x[3]);
+    printf("x par: %f %f %f %f\n", x_par[0], x_par[1], x_par[2], x_par[3]);
+
     // Compare results
-    float err = inf_err(x, x_par, num_rows * sizeof(float));
+    float err = inf_err(x, x_par, num_rows);
+    printf("Error: %f\n", err);
     if(err > 1e-4)
     {
         printf("CPU and GPU give different results (error > threshold)\n");
