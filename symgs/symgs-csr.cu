@@ -187,13 +187,12 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
     // Allocate memory on the GPU once for all (even though we may be wasting some space)
     check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
     check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
-
     check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
 
     float *d_x;
     check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
-    // No cudaMemcpy now: we will need to update x's values at each iteration
+    check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // We will need to update x at each iteration
 
     float *d_sum;
     float sum_temp;
@@ -204,7 +203,7 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
     // CUDA kernel parameters
     unsigned int N = 256; // N <= 1024
     dim3 threads_per_block(N, 1, 1);
-    dim3 num_blocks((num_rows + 1 - N) / N, 1, 1); // The GPU processes at most num_rows values per iteration
+    dim3 num_blocks((num_rows + N - 1) / N, 1, 1); // The GPU processes at most num_rows values per iteration
 
     // Forward sweep
     for (int i = 0; i < num_rows; i++)
@@ -213,8 +212,6 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_start = row_ptr[i];
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
-
-        check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
 
         reduction<<<num_blocks, threads_per_block>>>(d_col_ind, d_values, d_x, d_sum, row_start, row_end);
         check_kernel_call();
@@ -226,6 +223,8 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
+
+        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update the current value
     }
 
     // Backward sweep
@@ -248,6 +247,8 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
+
+        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update the current value
     }
 
     check_call(cudaFree(d_col_ind));
@@ -314,16 +315,14 @@ int main(int argc, const char *argv[])
     symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
     end_cpu = get_time();
 
-    printf("CPU version executed.\n");
+    // Print CPU time
+    printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
 
     start_gpu = get_time();
     symgs_csr_sw_parallel(row_ptr, col_ind, values, num_rows, x_par, matrixDiagonal, num_vals);
     end_gpu = get_time();
 
-    printf("GPU version executed.\n");
-
-    // Print time
-    printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
+    // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
     // Compare results
