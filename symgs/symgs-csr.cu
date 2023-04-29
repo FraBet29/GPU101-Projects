@@ -158,7 +158,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 }
 
 // Parallel reduction
-__global__ reduction(const int *col_ind, const float *values, const float *x, float *sum, const int row_start, const int row_end)
+__global__ void reduction(const int *col_ind, const float *values, const float *x, float *sum, const int row_start, const int row_end)
 {
     unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -185,21 +185,21 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
     float *d_values;
 
     // Allocate memory on the GPU once for all (even though we may be wasting some space)
-    check_call(cudaMalloc(d_col_ind, num_vals * sizeof(int)));
-    check_call(cudaMalloc(d_values, num_vals * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
+    check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
 
-    check_call(cudaMemcpy(&d_col_ind, &col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(&d_values, &values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
 
     float *d_x;
-    check_call(cudaMalloc(d_x, x, num_rows * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
     // No cudaMemcpy now: we will need to update x's values at each iteration
 
     float *d_sum;
     float sum_temp;
 
     // Allocate memory for the array used to perform the reduction on the GPU
-    check_call(cudaMalloc(d_sum, num_vals * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_sum, num_vals * sizeof(float)));
 
     // CUDA kernel parameters
     unsigned int N = 256; // N <= 1024
@@ -214,13 +214,13 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        check_call(cudaMemcpy(&d_x, &x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+        check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
 
         reduction<<<num_blocks, threads_per_block>>>(d_col_ind, d_values, d_x, d_sum, row_start, row_end);
         check_kernel_call();
         cudaDeviceSynchronize();
 
-        check_call(cudaMemcpy(&sum_temp, &d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+        check_call(cudaMemcpy(&sum_temp, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
         sum -= sum_temp;
 
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
@@ -236,13 +236,13 @@ void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        check_call(cudaMemcpy(&d_x, &x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+        check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
 
         reduction<<<num_blocks, threads_per_block>>>(d_col_ind, d_values, d_x, d_sum, row_start, row_end);
         check_kernel_call();
         cudaDeviceSynchronize();
 
-        check_call(cudaMemcpy(&sum_temp, &d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+        check_call(cudaMemcpy(&sum_temp, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
         sum -= sum_temp;
 
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
@@ -294,6 +294,8 @@ int main(int argc, const char *argv[])
 
     read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, filename, &num_rows, &num_cols, &num_vals);
     
+    printf("Input file read.\n");
+    
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *x_par = (float *)malloc(num_rows * sizeof(float));
 
@@ -305,16 +307,20 @@ int main(int argc, const char *argv[])
     }
 
     // Use the same random vector for the parallel version
-    memcpy(&x_par, &x, num_rows * sizeof(float));
+    memcpy(x_par, x, num_rows * sizeof(float));
 
     // Compute in sw
     start_cpu = get_time();
     symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
     end_cpu = get_time();
 
+    printf("CPU version executed.\n");
+
     start_gpu = get_time();
     symgs_csr_sw_parallel(row_ptr, col_ind, values, num_rows, x_par, matrixDiagonal, num_vals);
     end_gpu = get_time();
+
+    printf("GPU version executed.\n");
 
     // Print time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
