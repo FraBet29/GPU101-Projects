@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <thrust/count.h>
 
 #define check_call(call)                                     \
 {                                                            \
@@ -154,6 +155,64 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
+    }
+}
+
+// Graph coloring algorithm
+// SOURCE: https://developer.nvidia.com/blog/graph-coloring-more-parallelism-for-incomplete-lu-factorization/
+__global__ void color_jpl_kernel(int n, int c, const int *Ao, 
+                                 const int *Ac, const float *Av, 
+                                 const int *randoms, int *colors)
+{   
+  for (int i = threadIdx.x + blockIdx.x * blockDim.x; 
+       i < n; 
+       i += blockDim.x * gridDim.x) 
+  {   
+    bool f = true; // true iff you have max random
+
+    // ignore nodes colored earlier
+    if ((colors[i] != -1)) continue; 
+
+    int ir = randoms[i];
+
+    // look at neighbors to check their random number
+    for (int k = Ao[i]; k < Ao[i+1]; k++) {        
+      // ignore nodes colored earlier (and yourself)
+      int j = Ac[k];
+      int jc = colors[j];
+      if (((jc != -1) && (jc != c)) || (i == j)) continue; 
+      int jr = randoms[j];
+      if (ir <= jr) f = false;
+    }
+
+    // assign color if you have the maximum random number
+    if (f) colors[i] = c;
+  }
+}
+
+void color_jpl(int n, 
+               const int *Ao, const int *Ac, const float *Av, 
+               int *colors) 
+{   
+    int *randoms = (int *)malloc(n * sizeof(int)); // allocate and init random array
+
+    srand(time(NULL));
+    for (int i = 0; i < n; i++)
+    {
+        randoms[i] = (rand() % 100);
+    }
+
+    thrust::fill(colors, colors + n, -1); // init colors to -1
+
+    for(int c = 0; c < n; c++) {
+        int nt = 256;
+        int nb = ((n + nt - 1)/nt);
+        color_jpl_kernel<<<nb, nt>>>(n, c, 
+                                     Ao, Ac, Av, 
+                                     randoms, 
+                                     colors);
+        int left = (int)thrust::count(colors, colors + n, -1);
+        if (left == 0) break;
     }
 }
 
@@ -355,6 +414,17 @@ int main(int argc, const char *argv[])
     // Print CPU time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
 
+    int *colors = (int *)malloc(num_vals * sizeof(int));
+
+    color_jpl(num_vals, row_ptr, col_ind, values, colors);
+
+    for(int i = 0; i < num_vals; ++i)
+    {
+        printf("%d", colors[i]);
+    }
+    printf("\n");
+
+    /*
     start_gpu = get_time();
     symgs_csr_sw_parallel(row_ptr, col_ind, values, num_rows, x_par, matrixDiagonal, num_vals);
     end_gpu = get_time();
@@ -376,6 +446,7 @@ int main(int argc, const char *argv[])
     {
         printf("CPU and GPU give similar results (error < threshold)\n");
     }
+    */
 
     // Free
     free(row_ptr);
@@ -384,6 +455,7 @@ int main(int argc, const char *argv[])
     free(matrixDiagonal);
     free(x);
     free(x_par);
+    free(colors);
 
     return 0;
 }
