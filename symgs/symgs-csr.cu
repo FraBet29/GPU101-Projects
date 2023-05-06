@@ -3,7 +3,6 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
-#include <thrust/count.h>
 
 #define check_call(call)                                     \
 {                                                            \
@@ -158,7 +157,6 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
     }
 }
 
-/*
 // Graph coloring algorithm
 // SOURCE: https://developer.nvidia.com/blog/graph-coloring-more-parallelism-for-incomplete-lu-factorization/
 __global__ void color_jpl_kernel(int n, int c, const int *Ao, 
@@ -203,20 +201,45 @@ void color_jpl(int n,
         randoms[i] = (rand() % 100);
     }
 
-    thrust::fill(colors, colors + n, -1); // init colors to -1
+    int *d_randoms;
+
+    check_call(cudaMalloc((void **)&d_randoms, n * sizeof(int)));
+    check_call(cudaMemcpy(d_randoms, randoms, n * sizeof(int), cudaMemcpyHostToDevice));
+
+    for (int i = 0; i < n; i++)
+    {
+        colors[i] = -1; // init colors to -1
+    }
+
+    int *d_colors;
+
+    check_call(cudaMalloc((void **)&d_colors, n * sizeof(int)));
+    check_call(cudaMemcpy(d_colors, colors, n * sizeof(int), cudaMemcpyHostToDevice));
+
+    printf("Colors initialization ok.\n");
 
     for(int c = 0; c < n; c++) {
         int nt = 256;
         int nb = ((n + nt - 1)/nt);
         color_jpl_kernel<<<nb, nt>>>(n, c, 
                                      Ao, Ac, Av, 
-                                     randoms, 
-                                     colors);
-        int left = (int)thrust::count(colors, colors + n, -1);
+                                     d_randoms, 
+                                     d_colors);
+        check_kernel_call();
+        cudaDeviceSynchronize();
+        check_call(cudaMemcpy(colors, d_colors, n * sizeof(int), cudaMemcpyDeviceToHost));
+        int left = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (colors[i] == -1)
+            {
+                left = 1;
+                break;
+            }
+        }
         if (left == 0) break;
     }
 }
-*/
 
 /*
 // Parallel reduction
@@ -260,6 +283,12 @@ __global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind,
 
     for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
     {
+        x_flags[i] = 0;
+    }
+    __syncthreads();
+
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
+    {
         float sum = x[i];
         const int row_start = row_ptr[i];
         const int row_end = row_ptr[i + 1];
@@ -288,6 +317,12 @@ __global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind,
 __global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, const float *matrixDiagonal, int *x_flags)
 {
     unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        x_flags[i] = 0;
+    }
+    __syncthreads();
 
     for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
     {
@@ -374,18 +409,6 @@ int main(int argc, const char *argv[])
     // Print CPU time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
 
-    /*
-    int *colors = (int *)malloc(num_vals * sizeof(int));
-
-    color_jpl(num_vals, row_ptr, col_ind, values, colors);
-
-    for(int i = 0; i < num_vals; ++i)
-    {
-        printf("%d", colors[i]);
-    }
-    printf("\n");
-    */
-
     int *d_row_ptr, *d_col_ind;
     float *d_values, *d_matrixDiagonal, *d_x;
     int *d_x_flags;
@@ -402,10 +425,20 @@ int main(int argc, const char *argv[])
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_matrixDiagonal, d_matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
-    // INITIALIZE D_X_FLAGS TO ZERO!!!
 
-    printf("CUDA setup ok\n");
+    printf("CUDA setup ok.\n");
+
+    int *colors = (int *)malloc(num_vals * sizeof(int));
+
+    color_jpl(num_vals, d_row_ptr, d_col_ind, d_values, colors);
+
+    for(int i = 0; i < num_vals; ++i)
+    {
+        printf("%d", colors[i]);
+    }
+    printf("\n");
     
+    /*
     // CUDA kernel parameters
     unsigned int threads_per_block = 1024;
     unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
@@ -441,6 +474,7 @@ int main(int argc, const char *argv[])
     {
         printf("CPU and GPU give similar results (error < threshold)\n");
     }
+    */
 
     // Free
     free(row_ptr);
@@ -449,7 +483,7 @@ int main(int argc, const char *argv[])
     free(matrixDiagonal);
     free(x);
     free(x_par);
-    //free(colors);
+    free(colors);
     check_call(cudaFree(d_row_ptr));
     check_call(cudaFree(d_col_ind));
     check_call(cudaFree(d_values));
