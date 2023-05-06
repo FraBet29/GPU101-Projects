@@ -243,23 +243,26 @@ void color_jpl(int n,
 
 __global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, const int *colors, const int color)
 {   
-    int i = threadIdx.x + blockDim.x * blockIdx.x;
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    if (colors[i] == color)
-    {   
-        float sum = x[i];
-        const int row_start = row_ptr[i];
-        const int row_end = row_ptr[i + 1];
-        float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        if (colors[i] == color)
+        {   
+            float sum = x[i];
+            const int row_start = row_ptr[i];
+            const int row_end = row_ptr[i + 1];
+            float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        for (int j = row_start; j < row_end; j++)
-        {
-            sum -= values[j] * x[col_ind[j]];
+            for (int j = row_start; j < row_end; j++)
+            {
+                sum -= values[j] * x[col_ind[j]];
+            }
+
+            sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
+
+            x[i] = sum / currentDiagonal;
         }
-
-        sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
-
-        x[i] = sum / currentDiagonal;
     }
 }
 
@@ -456,19 +459,17 @@ int main(int argc, const char *argv[])
 
     color_jpl(num_vals, d_row_ptr, d_col_ind, d_values, colors);
 
-    /*
     for (int i = 0; i < num_vals; ++i)
     {
         printf("%d", colors[i]);
     }
     printf("\n");
-    */
 
     int num_colors = 0;
 
     for (int i = 0; i < num_vals; ++i)
     {
-        if (colors[i] > num_colors)
+        if (colors[i] + 1 > num_colors)
         {
             num_colors = colors[i];
         }
