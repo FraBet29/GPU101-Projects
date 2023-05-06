@@ -158,6 +158,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
     }
 }
 
+/*
 // Graph coloring algorithm
 // SOURCE: https://developer.nvidia.com/blog/graph-coloring-more-parallelism-for-incomplete-lu-factorization/
 __global__ void color_jpl_kernel(int n, int c, const int *Ao, 
@@ -215,7 +216,9 @@ void color_jpl(int n,
         if (left == 0) break;
     }
 }
+*/
 
+/*
 // Parallel reduction
 __global__ void reduction(const int *col_ind, const float *values, const float *x, float *red, const int row_start, const int row_end)
 {
@@ -248,109 +251,69 @@ __global__ void reduction(const int *col_ind, const float *values, const float *
         red[blockIdx.x] = sum[0];
     }
 }
+*/
 
 // GPU implementation of SYMGS using CSR
-void symgs_csr_sw_parallel(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, const int num_vals)
-{   
+__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flag)
+{
+    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    printf("Number of rows: %d\n", num_rows);
-    printf("Number of values: %d\n", num_vals);
-
-    int *d_col_ind;
-    float *d_values, *d_x;
-
-    check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
-    check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
-    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
-    check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // We will need to update x at each iteration
-
-    // CUDA kernel parameters
-    unsigned int threads_per_block = 64;
-    unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block; // The GPU processes at most row_values values per iteration (worst case)
-
-    printf("Number of blocks and threads per block: %d, %d\n", num_blocks, threads_per_block);
-
-    // Allocate arrays to perform reduction (each element will contain the result computed by one GPU block)
-    // The number of blocks effectively needed varies at each iteration, here we consider the worst case to perform one memory allocation once for all
-    float *h_red = (float *)malloc(num_blocks * sizeof(float));
-    float *d_red;
-
-    check_call(cudaMalloc((void**)&d_red, num_blocks * sizeof(float)));
-
-    // Forward sweep
-    for (int i = 0; i < num_rows; i++)
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
     {
         float sum = x[i];
         const int row_start = row_ptr[i];
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        printf("Processing values from %dth to %dth\n", row_start, row_end);
-
-        // Compute the number of blocks effectively needed
-        unsigned int num_blocks_eff = ((row_end - row_start) + threads_per_block - 1) / threads_per_block;
-
-        printf("Number of blocks effectively needed: %d\n", num_blocks_eff);
-
-        reduction<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(d_col_ind, d_values, d_x, d_red, row_start, row_end);
-        check_kernel_call();
-        cudaDeviceSynchronize();
-
-        // Copy the elements which have been effectively processed
-        check_call(cudaMemcpy(h_red, d_red, num_blocks_eff * sizeof(float), cudaMemcpyDeviceToHost));
-
-        // Complete reduction
-        for(int j = 0; j < num_blocks_eff; ++j)
+        for (int j = i; j < row_end; j++) // Old values
         {
-            sum -= h_red[j];
+            sum -= values[j] * x[col_ind[j]];
+        }
+
+        for (int j = row_start; j < i; j++) // New values
+        {   
+            if (x_flag[col_ind[j]] == 1)
+                sum -= values[j] * x[col_ind[j]];
+            else
+                j--; // Wait until the needed value of x is updated
         }
 
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
-
-        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update current x
+        x_flag[i] = 1;
     }
+}
 
-    // Backward sweep
-    for (int i = num_rows - 1; i >= 0; i--)
+__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flag)
+{
+    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
     {
         float sum = x[i];
         const int row_start = row_ptr[i];
         const int row_end = row_ptr[i + 1];
         float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
-        // Compute the number of blocks effectively needed
-        unsigned int num_blocks_eff = ((row_end - row_start) + threads_per_block - 1) / threads_per_block;
-
-        reduction<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(d_col_ind, d_values, d_x, d_red, row_start, row_end);
-        check_kernel_call();
-        cudaDeviceSynchronize();
-
-        // Copy the elements which have been effectively processed
-        check_call(cudaMemcpy(h_red, d_red, num_blocks_eff * sizeof(float), cudaMemcpyDeviceToHost));
-
-        // Complete reduction
-        for(int j = 0; j < num_blocks_eff; ++j)
+        for (int j = row_start; j < i; j++) // Old values
         {
-            sum -= h_red[j];
+            sum -= values[j] * x[col_ind[j]];
         }
-        
+
+        for (int j = i; j < row_end; j++) // New values
+        {   
+            if (x_flag[col_ind[j]] == 1)
+                sum -= values[j] * x[col_ind[j]];
+            else
+                j--; // Wait until the needed value of x is updated
+        }
+
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
-
-        check_call(cudaMemcpy(d_x + i, x + i, sizeof(float), cudaMemcpyHostToDevice)); // Update current x
+        x_flag[i] = 1;
     }
-
-    free(h_red);
-    check_call(cudaFree(d_col_ind));
-    check_call(cudaFree(d_values));
-    check_call(cudaFree(d_x));
-    check_call(cudaFree(d_red));
-
 }
 
 float abs(const float x, const float y)
@@ -403,17 +366,15 @@ int main(int argc, const char *argv[])
         x[i] = (rand() % 100) / (rand() % 100 + 1); // the number we use to divide cannot be 0, that'offset the reason of the +1
     }
 
-    // Use the same random vector for the parallel version
-    memcpy(x_par, x, num_rows * sizeof(float));
-
     // Compute in sw
     start_cpu = get_time();
-    symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
+    symgs_csr_sw(d_row_ptr, d_col_ind, values, num_rows, d_x, d_matrixDiagonal);
     end_cpu = get_time();
 
     // Print CPU time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
 
+    /*
     int *colors = (int *)malloc(num_vals * sizeof(int));
 
     color_jpl(num_vals, row_ptr, col_ind, values, colors);
@@ -423,14 +384,55 @@ int main(int argc, const char *argv[])
         printf("%d", colors[i]);
     }
     printf("\n");
+    */
 
-    /*
+    int *d_row_ptr, *d_col_ind;
+    float *d_values, *d_matrixDiagonal, *d_x;
+    int *d_x_flag;
+
+    check_call(cudaMalloc((void**)&d_row_ptr, (num_rows + 1) * sizeof(int)));
+    check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
+    check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_matrixDiagonal, num_rows * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_x_flag, num_rows * sizeof(int)));
+
+    check_call(cudaMemcpy(d_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_matrixDiagonal, d_matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
+
+    // CUDA kernel parameters
+    unsigned int threads_per_block = 1024;
+    unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
+
     start_gpu = get_time();
-    symgs_csr_sw_parallel(row_ptr, col_ind, values, num_rows, x_par, matrixDiagonal, num_vals);
+
+    for (int i = 0; i < num_rows; i++)
+    {
+        d_x_flags[i] = 0;
+    }
+
+    symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(row_ptr, col_ind, values, num_rows, num_vals, x_par, matrixDiagonal, d_x_flag); // Forward sweep
+    check_kernel_call();
+    cudaDeviceSynchronize();
+
+    for (int i = 0; i < num_rows; i++)
+    {
+        d_x_flags[i] = 0;
+    }
+
+    symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(row_ptr, col_ind, values, num_rows, num_vals, x_par, matrixDiagonal, d_x_flag); // Backward sweep
+    check_kernel_call();
+    cudaDeviceSynchronize();
+
     end_gpu = get_time();
 
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
+
+    check_call(cudaMemcpy(x_par, d_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
 
     printf("x: %f %f %f %f %f\n", x[0], x[1], x[2], x[3], x[4]);
     printf("x par: %f %f %f %f %f\n", x_par[0], x_par[1], x_par[2], x_par[3], x_par[4]);
@@ -446,7 +448,6 @@ int main(int argc, const char *argv[])
     {
         printf("CPU and GPU give similar results (error < threshold)\n");
     }
-    */
 
     // Free
     free(row_ptr);
@@ -455,7 +456,12 @@ int main(int argc, const char *argv[])
     free(matrixDiagonal);
     free(x);
     free(x_par);
-    free(colors);
+    //free(colors);
+    check_call(cudaFree(d_row_ptr));
+    check_call(cudaFree(d_col_ind));
+    check_call(cudaFree(d_values));
+    check_call(cudaFree(d_matrixDiagonal));
+    check_call(cudaFree(d_x));
 
     return 0;
 }
