@@ -241,6 +241,28 @@ void color_jpl(int n,
     }
 }
 
+__global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, const int *colors, const int color)
+{   
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+
+    if (colors[i] == color)
+    {   
+        float sum = x[i];
+        const int row_start = row_ptr[i];
+        const int row_end = row_ptr[i + 1];
+        float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+
+        for (int j = row_start; j < row_end; j++)
+        {
+            sum -= values[j] * x[col_ind[j]];
+        }
+
+        sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
+
+        x[i] = sum / currentDiagonal;
+    }
+}
+
 /*
 // Parallel reduction
 __global__ void reduction(const int *col_ind, const float *values, const float *x, float *red, const int row_start, const int row_end)
@@ -428,22 +450,55 @@ int main(int argc, const char *argv[])
 
     printf("CUDA setup ok.\n");
 
+    start_gpu = get_time();
+
     int *colors = (int *)malloc(num_vals * sizeof(int));
 
     color_jpl(num_vals, d_row_ptr, d_col_ind, d_values, colors);
 
-    for(int i = 0; i < num_vals; ++i)
+    /*
+    for (int i = 0; i < num_vals; ++i)
     {
         printf("%d", colors[i]);
     }
     printf("\n");
+    */
+
+    int num_colors = 0;
+
+    for (int i = 0; i < num_vals; ++i)
+    {
+        if (colors[i] > num_colors)
+        {
+            num_colors = colors[i];
+        }
+    }
+
+    int *d_colors;
+
+    check_call(cudaMalloc((void **)&d_colors, num_vals * sizeof(int)));
+    check_call(cudaMemcpy(d_colors, colors, num_vals * sizeof(int), cudaMemcpyHostToDevice));
+
+    // CUDA kernel parameters
+    unsigned int threads_per_block = 1024;
+    unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
+
+    for (int i = 0; i < num_colors; i++)
+    {
+        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
+    }
+
+    for (int i = num_colors - 1; i >= 0; i--)
+    {
+        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
+    }
+
+    end_gpu = get_time();
     
     /*
     // CUDA kernel parameters
     unsigned int threads_per_block = 1024;
     unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
-
-    start_gpu = get_time();
 
     symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Forward sweep
     check_kernel_call();
@@ -452,8 +507,7 @@ int main(int argc, const char *argv[])
     symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Backward sweep
     check_kernel_call();
     cudaDeviceSynchronize();
-
-    end_gpu = get_time();
+    */
 
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
@@ -474,7 +528,6 @@ int main(int argc, const char *argv[])
     {
         printf("CPU and GPU give similar results (error < threshold)\n");
     }
-    */
 
     // Free
     free(row_ptr);
