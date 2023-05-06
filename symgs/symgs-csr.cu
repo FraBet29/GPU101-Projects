@@ -254,7 +254,7 @@ __global__ void reduction(const int *col_ind, const float *values, const float *
 */
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flag)
+__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flags)
 {
     unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -272,7 +272,7 @@ __global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind,
 
         for (int j = row_start; j < i; j++) // New values
         {   
-            if (x_flag[col_ind[j]] == 1)
+            if (x_flags[col_ind[j]] == 1)
                 sum -= values[j] * x[col_ind[j]];
             else
                 j--; // Wait until the needed value of x is updated
@@ -281,11 +281,11 @@ __global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind,
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
-        x_flag[i] = 1;
+        x_flags[i] = 1;
     }
 }
 
-__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flag)
+__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flags)
 {
     unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -303,7 +303,7 @@ __global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind,
 
         for (int j = i; j < row_end; j++) // New values
         {   
-            if (x_flag[col_ind[j]] == 1)
+            if (x_flags[col_ind[j]] == 1)
                 sum -= values[j] * x[col_ind[j]];
             else
                 j--; // Wait until the needed value of x is updated
@@ -312,7 +312,7 @@ __global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind,
         sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
         x[i] = sum / currentDiagonal;
-        x_flag[i] = 1;
+        x_flags[i] = 1;
     }
 }
 
@@ -368,7 +368,7 @@ int main(int argc, const char *argv[])
 
     // Compute in sw
     start_cpu = get_time();
-    symgs_csr_sw(d_row_ptr, d_col_ind, values, num_rows, d_x, d_matrixDiagonal);
+    symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
     end_cpu = get_time();
 
     // Print CPU time
@@ -388,14 +388,14 @@ int main(int argc, const char *argv[])
 
     int *d_row_ptr, *d_col_ind;
     float *d_values, *d_matrixDiagonal, *d_x;
-    int *d_x_flag;
+    int *d_x_flags;
 
     check_call(cudaMalloc((void**)&d_row_ptr, (num_rows + 1) * sizeof(int)));
     check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
     check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
     check_call(cudaMalloc((void**)&d_matrixDiagonal, num_rows * sizeof(float)));
     check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
-    check_call(cudaMalloc((void**)&d_x_flag, num_rows * sizeof(int)));
+    check_call(cudaMalloc((void**)&d_x_flags, num_rows * sizeof(int)));
 
     check_call(cudaMemcpy(d_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
@@ -414,7 +414,7 @@ int main(int argc, const char *argv[])
         d_x_flags[i] = 0;
     }
 
-    symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(row_ptr, col_ind, values, num_rows, num_vals, x_par, matrixDiagonal, d_x_flag); // Forward sweep
+    symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Forward sweep
     check_kernel_call();
     cudaDeviceSynchronize();
 
@@ -423,7 +423,7 @@ int main(int argc, const char *argv[])
         d_x_flags[i] = 0;
     }
 
-    symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(row_ptr, col_ind, values, num_rows, num_vals, x_par, matrixDiagonal, d_x_flag); // Backward sweep
+    symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Backward sweep
     check_kernel_call();
     cudaDeviceSynchronize();
 
