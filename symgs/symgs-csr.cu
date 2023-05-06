@@ -254,7 +254,7 @@ __global__ void reduction(const int *col_ind, const float *values, const float *
 */
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flags)
+__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, const float *matrixDiagonal, int *x_flags)
 {
     unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -285,7 +285,7 @@ __global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind,
     }
 }
 
-__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, float *matrixDiagonal, int *x_flags)
+__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, const float *matrixDiagonal, int *x_flags)
 {
     unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -300,7 +300,7 @@ __global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind,
         {
             sum -= values[j] * x[col_ind[j]];
         }
-
+        
         for (int j = i; j < row_end; j++) // New values
         {   
             if (x_flags[col_ind[j]] == 1)
@@ -402,26 +402,19 @@ int main(int argc, const char *argv[])
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_matrixDiagonal, d_matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
+    // INITIALIZE D_X_FLAGS TO ZERO!!!
 
+    printf("CUDA setup ok\n");
+    
     // CUDA kernel parameters
     unsigned int threads_per_block = 1024;
     unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
 
     start_gpu = get_time();
 
-    for (int i = 0; i < num_rows; i++)
-    {
-        d_x_flags[i] = 0;
-    }
-
     symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Forward sweep
     check_kernel_call();
     cudaDeviceSynchronize();
-
-    for (int i = 0; i < num_rows; i++)
-    {
-        d_x_flags[i] = 0;
-    }
 
     symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Backward sweep
     check_kernel_call();
