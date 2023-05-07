@@ -159,46 +159,40 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
 // Graph coloring algorithm
 // SOURCE: https://developer.nvidia.com/blog/graph-coloring-more-parallelism-for-incomplete-lu-factorization/
-__global__ void color_jpl_kernel(int n, int c, const int *Ao, 
-                                 const int *Ac, const float *Av, 
-                                 const int *randoms, int *colors)
+__global__ void color_jpl_kernel(int n, int c, const int *Ao, const int *Ac, const float *Av, const int *randoms, int *colors)
 {   
-  for (int i = threadIdx.x + blockIdx.x * blockDim.x; 
-       i < n; 
-       i += blockDim.x * gridDim.x) 
-  {   
-    bool f = true; // true iff you have max random
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n; i += blockDim.x * gridDim.x) 
+    {   
+        bool f = true; // true iff you have max random
 
-    // ignore nodes colored earlier
-    if ((colors[i] != -1)) continue; 
+        if ((colors[i] != -1)) continue; // ignore nodes colored earlier
 
-    int ir = randoms[i];
+        int ir = randoms[i];
 
-    // look at neighbors to check their random number
-    for (int k = Ao[i]; k < Ao[i+1]; k++) {        
-      // ignore nodes colored earlier (and yourself)
-      int j = Ac[k];
-      int jc = colors[j];
-      if (((jc != -1) && (jc != c)) || (i == j)) continue; 
-      int jr = randoms[j];
-      if (ir <= jr) f = false;
+        // look at neighbors to check their random number
+        for (int k = Ao[i]; k < Ao[i+1]; k++)
+        {
+          // ignore nodes colored earlier (and yourself)
+          int j = Ac[k];
+          int jc = colors[j];
+          if (((jc != -1) && (jc != c)) || (i == j)) continue; 
+          int jr = randoms[j];
+          if (ir <= jr) f = false;
+        }
+
+        if (f) colors[i] = c; // assign color if you have the maximum random number
     }
-
-    // assign color if you have the maximum random number
-    if (f) colors[i] = c;
-  }
 }
 
-void color_jpl(int n, 
-               const int *Ao, const int *Ac, const float *Av, 
-               int *colors) 
+// Ao contains the matrix row offsets, Ac contains the column indices, and Av contains the non-zero values
+void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors) 
 {   
     int *randoms = (int *)malloc(n * sizeof(int)); // allocate and init random array
 
     srand(time(NULL));
     for (int i = 0; i < n; i++)
     {
-        randoms[i] = (rand() % 100);
+        randoms[i] = (rand() % 1000);
     }
 
     int *d_randoms;
@@ -218,16 +212,15 @@ void color_jpl(int n,
 
     printf("Colors initialization ok.\n");
 
-    for(int c = 0; c < n; c++) {
+    for(int c = 0; c < n; c++)
+    {
         int nt = 256;
-        int nb = ((n + nt - 1)/nt);
-        color_jpl_kernel<<<nb, nt>>>(n, c, 
-                                     Ao, Ac, Av, 
-                                     d_randoms, 
-                                     d_colors);
+        int nb = (n + nt - 1) / nt;
+        color_jpl_kernel<<<nb, nt>>>(n, c, Ao, Ac, Av, d_randoms, d_colors);
         check_kernel_call();
         cudaDeviceSynchronize();
         check_call(cudaMemcpy(colors, d_colors, n * sizeof(int), cudaMemcpyDeviceToHost));
+        /*
         int left = 0;
         for (int i = 0; i < n; i++)
         {
@@ -238,6 +231,7 @@ void color_jpl(int n,
             }
         }
         if (left == 0) break;
+        */
     }
 }
 
@@ -263,116 +257,6 @@ __global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, cons
 
             x[i] = sum / currentDiagonal;
         }
-    }
-}
-
-/*
-// Parallel reduction
-__global__ void reduction(const int *col_ind, const float *values, const float *x, float *red, const int row_start, const int row_end)
-{
-    extern __shared__ float sum[]; // Array of size blockDim.x (i.e. threads_per_block)
-
-    unsigned int i = threadIdx.x; // Local thread ID
-    unsigned int tid = threadIdx.x + blockDim.x * blockIdx.x; // Global thread ID (potentially ranging from 0 to num_rows)
-
-    if(tid > row_start && tid < row_end)
-    {
-        sum[i] = values[tid] * x[col_ind[tid]]; // Compute all the values to be added
-    }
-    else
-    {
-        sum[i] = 0.0f;
-    }
-    __syncthreads();
-
-    for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
-	  {	
-		    if(i < s)
-        {
-			      sum[i] += sum[i + s];
-		    }
-		    __syncthreads();
-    }
-
-    if(i == 0)
-    {
-        red[blockIdx.x] = sum[0];
-    }
-}
-*/
-
-// GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_sw_parallel_fw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, const float *matrixDiagonal, int *x_flags)
-{
-    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
-
-    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
-    {
-        x_flags[i] = 0;
-    }
-    __syncthreads();
-
-    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
-    {
-        float sum = x[i];
-        const int row_start = row_ptr[i];
-        const int row_end = row_ptr[i + 1];
-        float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
-
-        for (int j = i; j < row_end; j++) // Old values
-        {
-            sum -= values[j] * x[col_ind[j]];
-        }
-
-        for (int j = row_start; j < i; j++) // New values
-        {   
-            if (x_flags[col_ind[j]] == 1)
-                sum -= values[j] * x[col_ind[j]];
-            else
-                j--; // Wait until the needed value of x is updated
-        }
-
-        sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
-
-        x[i] = sum / currentDiagonal;
-        x_flags[i] = 1;
-    }
-}
-
-__global__ void symgs_csr_sw_parallel_bw(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, const int num_vals, float *x, const float *matrixDiagonal, int *x_flags)
-{
-    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
-
-    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
-    {
-        x_flags[i] = 0;
-    }
-    __syncthreads();
-
-    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
-    {
-        float sum = x[i];
-        const int row_start = row_ptr[i];
-        const int row_end = row_ptr[i + 1];
-        float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
-
-        for (int j = row_start; j < i; j++) // Old values
-        {
-            sum -= values[j] * x[col_ind[j]];
-        }
-        
-        for (int j = i; j < row_end; j++) // New values
-        {   
-            if (x_flags[col_ind[j]] == 1)
-                sum -= values[j] * x[col_ind[j]];
-            else
-                j--; // Wait until the needed value of x is updated
-        }
-
-        sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
-
-        x[i] = sum / currentDiagonal;
-        x_flags[i] = 1;
     }
 }
 
@@ -455,11 +339,11 @@ int main(int argc, const char *argv[])
 
     start_gpu = get_time();
 
-    int *colors = (int *)malloc(num_vals * sizeof(int));
+    int *colors = (int *)malloc(num_rows * sizeof(int));
 
-    color_jpl(num_vals, d_row_ptr, d_col_ind, d_values, colors);
+    color_jpl(num_rows, d_row_ptr, d_col_ind, d_values, colors);
 
-    for (int i = 0; i < num_vals; ++i)
+    for (int i = 0; i < num_rows; ++i)
     {
         printf("%d", colors[i]);
     }
@@ -467,7 +351,7 @@ int main(int argc, const char *argv[])
 
     int num_colors = 0;
 
-    for (int i = 0; i < num_vals; ++i)
+    for (int i = 0; i < num_rows; ++i)
     {
         if (colors[i] + 1 > num_colors)
         {
@@ -477,8 +361,8 @@ int main(int argc, const char *argv[])
 
     int *d_colors;
 
-    check_call(cudaMalloc((void **)&d_colors, num_vals * sizeof(int)));
-    check_call(cudaMemcpy(d_colors, colors, num_vals * sizeof(int), cudaMemcpyHostToDevice));
+    check_call(cudaMalloc((void **)&d_colors, num_rows * sizeof(int)));
+    check_call(cudaMemcpy(d_colors, colors, num_rows * sizeof(int), cudaMemcpyHostToDevice));
 
     // CUDA kernel parameters
     unsigned int threads_per_block = 1024;
@@ -495,20 +379,6 @@ int main(int argc, const char *argv[])
     }
 
     end_gpu = get_time();
-    
-    /*
-    // CUDA kernel parameters
-    unsigned int threads_per_block = 1024;
-    unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
-
-    symgs_csr_sw_parallel_fw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Forward sweep
-    check_kernel_call();
-    cudaDeviceSynchronize();
-
-    symgs_csr_sw_parallel_bw<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, num_vals, d_x, d_matrixDiagonal, d_x_flags); // Backward sweep
-    check_kernel_call();
-    cudaDeviceSynchronize();
-    */
 
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
