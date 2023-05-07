@@ -138,7 +138,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
         x[i] = sum / currentDiagonal;
     }
-
+/*
     // backward sweep
     for (int i = num_rows - 1; i >= 0; i--)
     {
@@ -155,6 +155,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
         x[i] = sum / currentDiagonal;
     }
+*/
 }
 
 // Graph coloring algorithm
@@ -195,6 +196,12 @@ void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors
         randoms[i] = (rand() % 1000);
     }
 
+    for (int i = 0; i < n; i++)
+        {
+            printf("%d ", randoms[i]);
+        }
+        printf("\n");
+
     int *d_randoms;
 
     check_call(cudaMalloc((void **)&d_randoms, n * sizeof(int)));
@@ -220,6 +227,11 @@ void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors
         check_kernel_call();
         cudaDeviceSynchronize();
         check_call(cudaMemcpy(colors, d_colors, n * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < n; i++)
+        {
+            printf("%d ", colors[i]);
+        }
+        printf("\n");
         /*
         int left = 0;
         for (int i = 0; i < n; i++)
@@ -232,6 +244,29 @@ void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors
         }
         if (left == 0) break;
         */
+    }
+}
+
+__global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, int *colors)
+{
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (int i = idx; i < num_rows; i += gridDim.x * blockDim.x)
+    {
+        const int row_start = row_ptr[i];
+        const int row_end = row_ptr[i + 1];
+
+        int curr = -1;
+        int prev = -1;
+
+        for (int j = row_start; j < row_end; j++)
+        {
+            prev = curr;
+            curr = col_ind[j];
+            if (curr >= i) break;
+        }
+
+        colors[i] = prev + 1;
     }
 }
 
@@ -332,51 +367,52 @@ int main(int argc, const char *argv[])
     check_call(cudaMemcpy(d_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(d_matrixDiagonal, d_matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(d_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
 
     printf("CUDA setup ok.\n");
-
-    start_gpu = get_time();
-
-    int *colors = (int *)malloc(num_rows * sizeof(int));
-
-    color_jpl(num_rows, d_row_ptr, d_col_ind, d_values, colors);
-
-    for (int i = 0; i < num_rows; ++i)
-    {
-        printf("%d", colors[i]);
-    }
-    printf("\n");
-
-    int num_colors = 0;
-
-    for (int i = 0; i < num_rows; ++i)
-    {
-        if (colors[i] + 1 > num_colors)
-        {
-            num_colors = colors[i];
-        }
-    }
-
-    int *d_colors;
-
-    check_call(cudaMalloc((void **)&d_colors, num_rows * sizeof(int)));
-    check_call(cudaMemcpy(d_colors, colors, num_rows * sizeof(int), cudaMemcpyHostToDevice));
 
     // CUDA kernel parameters
     unsigned int threads_per_block = 1024;
     unsigned int num_blocks = (num_rows + threads_per_block - 1) / threads_per_block;
 
-    for (int i = 0; i < num_colors; i++)
+    start_gpu = get_time();
+    
+    int *colors = (int *)malloc(num_rows * sizeof(int));
+
+    //color_jpl(num_rows, d_row_ptr, d_col_ind, d_values, colors);
+    
+    int *d_colors;
+
+    check_call(cudaMalloc((void **)&d_colors, num_rows * sizeof(int)));
+
+    my_color<<<num_blocks, threads_per_block>>>(num_rows, d_row_ptr, d_col_ind, d_colors);
+
+    //check_call(cudaMemcpy(d_colors, colors, num_rows * sizeof(int), cudaMemcpyHostToDevice));
+    check_call(cudaMemcpy(colors, d_colors, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int num_colors = 0;
+    int free_val = 0;
+
+    for (int i = 0; i < num_rows; ++i)
+    {
+        if (colors[i] >= free_val) num_colors++;
+        free_val++;
+    }
+    printf("Old vs new iterations: %d %d\n", num_rows, num_colors);
+
+    num_blocks = (num_rows - num_colors + threads_per_block - 1) / threads_per_block;
+
+    for (int i = 0; i < num_rows; i++)
     {
         symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
     }
-
+    /*
     for (int i = num_colors - 1; i >= 0; i--)
     {
         symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
     }
+    */
 
     end_gpu = get_time();
 
@@ -416,6 +452,9 @@ int main(int argc, const char *argv[])
 
     return 0;
 }
+
+// IDEA: FIND INDEPENDENT SUBSETS OF VARIABLES VIA A GRAPH COLORING ALGORITHM, THEN APPLY GAUSS-SEIDEL ON EVERY SUBSET
+// TWO VARIABLES HAVE THE SAME COLOR IF THEY ARE INDEPENDENT
 
 // CHECK IF THE MATRIX FITS INTO THE GPU
 // SHARED MEMORY IMPLEMENTATION?
