@@ -158,7 +158,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
 }
 
-__global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, int *colors_fw, int *colors_bw)
+__global__ void graph_coloring(int num_rows, const int *row_ptr, const int *col_ind, int *colors_fw, int *colors_bw)
 {
     int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -190,6 +190,35 @@ __global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, i
         }
 
         colors_bw[i] = prev - 1;
+    }
+}
+
+__global__ void count_colors(const int n, int *nc, int *colors, int FORWARD)
+{
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+    if (idx == 0) *nc = 0;
+    __syncthreads();
+
+    for (int i = idx; i < n; i += gridDim.x * blockDim.x)
+    {
+        if ((FORWARD && colors[i] >= i) || ((!FORWARD) && colors[i] <= i)) atomicAdd(nc, 1);
+    }
+}
+
+__global__ void set_color_map(const int n, int *map, int *colors)
+{
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for (int i = idx; i < n; i += gridDim.x * blockDim.x)
+    {
+        map[i] = 0;
+    }
+    __syncthreads();
+
+    for (int i = idx; i < n; i += gridDim.x * blockDim.x)
+    {
+        if (map[colors[i]] == 0) map[colors[i]] = 1; 
     }
 }
 
@@ -313,7 +342,9 @@ int main(int argc, const char *argv[])
     check_call(cudaMalloc((void **)&d_colors_fw, num_rows * sizeof(int)));
     check_call(cudaMalloc((void **)&d_colors_bw, num_rows * sizeof(int)));
 
-    my_color<<<num_blocks, threads_per_block>>>(num_rows, d_row_ptr, d_col_ind, d_colors_fw, d_colors_bw);
+    graph_coloring<<<num_blocks, threads_per_block>>>(num_rows, d_row_ptr, d_col_ind, d_colors_fw, d_colors_bw);
+    check_kernel_call();
+    cudaDeviceSynchronize();
 
     check_call(cudaMemcpy(colors_fw, d_colors_fw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
     check_call(cudaMemcpy(colors_bw, d_colors_bw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
@@ -326,22 +357,44 @@ int main(int argc, const char *argv[])
     printf("\n");
     */
 
-    int num_colors_fw = 0;
-    int num_colors_bw = 0;
+    int num_colors_fw, num_colors_bw;
+    int *d_num_colors_fw, *d_num_colors_bw;
 
-    for (int i = 0; i < num_rows; ++i)
-    {
-        if (colors_fw[i] >= i) num_colors_fw++;
-    }
-    for (int i = num_rows - 1; i > -1; i--)
-    {
-        if (colors_bw[i] <= i) num_colors_bw++;
-    }
+    check_call(cudaMalloc((void **)&d_num_colors_fw, sizeof(int)));
+    check_call(cudaMalloc((void **)&d_num_colors_bw, sizeof(int)));
+
+    count_colors<<<num_blocks, threads_per_block>>>(num_rows, d_num_colors_fw, d_colors_fw, 1);
+    check_kernel_call();
+    cudaDeviceSynchronize();
+    count_colors<<<num_blocks, threads_per_block>>>(num_rows, d_num_colors_bw, d_colors_bw, 0);
+    check_kernel_call();
+    cudaDeviceSynchronize();
+
+    check_call(cudaMemcpy(&num_colors_fw, d_num_colors_fw, sizeof(int), cudaMemcpyDeviceToHost));
+    check_call(cudaMemcpy(&num_colors_bw, d_num_colors_bw, sizeof(int), cudaMemcpyDeviceToHost));
+
     printf("Old vs new iterations fw: %d %d\n", num_rows, num_colors_fw);
     printf("Old vs new iterations bw: %d %d\n", num_rows, num_colors_bw);
 
     int num_blocks_fw = (num_rows - num_colors_fw + threads_per_block - 1) / threads_per_block;
     int num_blocks_bw = (num_rows - num_colors_bw + threads_per_block - 1) / threads_per_block;
+
+    int *map_fw = (int *)malloc(num_rows * sizeof(int));
+    int *map_bw = (int *)malloc(num_rows * sizeof(int));
+    int *d_map_fw, *d_map_bw;
+
+    check_call(cudaMalloc((void **)&d_map_fw, num_rows * sizeof(int)));
+    check_call(cudaMalloc((void **)&d_map_bw, num_rows * sizeof(int)));
+
+    set_color_map<<<num_blocks, threads_per_block>>>(num_rows, d_map_fw, d_colors_fw);
+    check_kernel_call();
+    cudaDeviceSynchronize();
+    set_color_map<<<num_blocks_bw, threads_per_block>>>(num_rows, d_map_bw, d_colors_bw);
+    check_kernel_call();
+    cudaDeviceSynchronize();
+
+    check_call(cudaMemcpy(map_fw, d_map_fw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
+    check_call(cudaMemcpy(map_bw, d_map_bw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
     
     for (int i = 0; i < num_rows; i++)
     {
@@ -394,6 +447,8 @@ int main(int argc, const char *argv[])
     check_call(cudaFree(d_x_new));
     check_call(cudaFree(d_colors_fw));
     check_call(cudaFree(d_colors_bw));
+    check_call(cudaFree(d_num_colors_fw));
+    check_call(cudaFree(d_num_colors_bw));
 
     return 0;
 }
