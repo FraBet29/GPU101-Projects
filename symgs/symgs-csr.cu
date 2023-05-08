@@ -397,17 +397,23 @@ int main(int argc, const char *argv[])
     check_call(cudaMemcpy(map_bw, d_map_bw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
     
     for (int i = 0; i < num_rows; i++)
-    {
-        symgs_csr_sw_colors<<<num_blocks_fw, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_fw, i);
-        check_kernel_call();
-        cudaDeviceSynchronize();
+    {   
+        if (map_fw[i])
+        {
+          symgs_csr_sw_colors<<<num_blocks_fw, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_fw, i);
+          check_kernel_call();
+          cudaDeviceSynchronize();
+        }
         check_call(cudaMemcpy(&d_x_new[i], &d_x_old[i], sizeof(float), cudaMemcpyDeviceToDevice));
     }
     for (int i = num_rows - 1; i >= 0; i--)
-    {
-        symgs_csr_sw_colors<<<num_blocks_bw, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_bw, i);
-        check_kernel_call();
-        cudaDeviceSynchronize();
+    {   
+        if (map_bw[i])
+        {
+            symgs_csr_sw_colors<<<num_blocks_bw, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_bw, i);
+            check_kernel_call();
+            cudaDeviceSynchronize();
+        } 
         check_call(cudaMemcpy(&d_x_new[i], &d_x_old[i], sizeof(float), cudaMemcpyDeviceToDevice));
     }
 
