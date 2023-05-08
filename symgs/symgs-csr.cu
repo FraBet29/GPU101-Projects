@@ -138,7 +138,7 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
         x[i] = sum / currentDiagonal;
     }
-/*
+
     // backward sweep
     for (int i = num_rows - 1; i >= 0; i--)
     {
@@ -155,9 +155,10 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 
         x[i] = sum / currentDiagonal;
     }
-*/
+
 }
 
+/*
 // Graph coloring algorithm
 // SOURCE: https://developer.nvidia.com/blog/graph-coloring-more-parallelism-for-incomplete-lu-factorization/
 __global__ void color_jpl_kernel(int n, int c, const int *Ao, const int *Ac, const float *Av, const int *randoms, int *colors)
@@ -232,7 +233,6 @@ void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors
             printf("%d ", colors[i]);
         }
         printf("\n");
-        /*
         int left = 0;
         for (int i = 0; i < n; i++)
         {
@@ -243,11 +243,11 @@ void color_jpl(int n, const int *Ao, const int *Ac, const float *Av, int *colors
             }
         }
         if (left == 0) break;
-        */
     }
 }
+*/
 
-__global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, int *colors)
+__global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, int *colors_fw, int *colors_bw)
 {
     int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -266,11 +266,23 @@ __global__ void my_color(int num_rows, const int *row_ptr, const int *col_ind, i
             if (curr >= i) break;
         }
 
-        colors[i] = prev + 1;
+        colors_fw[i] = prev + 1;
+
+        curr = num_rows;
+        prev = num_rows;
+
+        for (int j = row_end - 1; j > -1; j--)
+        {
+            prev = curr;
+            curr = col_ind[j];
+            if (curr <= i) break;
+        }
+
+        colors_bw[i] = prev - 1;
     }
 }
 
-__global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, const int *colors, const int color)
+__global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x_old, float *x_new, float *matrixDiagonal, const int *colors, const int color)
 {   
     int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -278,19 +290,19 @@ __global__ void symgs_csr_sw_colors(const int *row_ptr, const int *col_ind, cons
     {
         if (colors[i] == color)
         {   
-            float sum = x[i];
+            float sum = x_new[i];
             const int row_start = row_ptr[i];
             const int row_end = row_ptr[i + 1];
             float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
 
             for (int j = row_start; j < row_end; j++)
             {
-                sum -= values[j] * x[col_ind[j]];
+                sum -= values[j] * x_new[col_ind[j]];
             }
 
-            sum += x[i] * currentDiagonal; // Remove diagonal contribution from previous loop
+            sum += x_new[i] * currentDiagonal; // Remove diagonal contribution from previous loop
 
-            x[i] = sum / currentDiagonal;
+            x_old[i] = sum / currentDiagonal;
         }
     }
 }
@@ -337,6 +349,10 @@ int main(int argc, const char *argv[])
     
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *x_par = (float *)malloc(num_rows * sizeof(float));
+    float *d_x_old, *d_x_new;
+
+    check_call(cudaMalloc((void**)&d_x_old, num_rows * sizeof(float)));
+    check_call(cudaMalloc((void**)&d_x_new, num_rows * sizeof(float)));
 
     // Generate a random vector
     srand(time(NULL));
@@ -344,6 +360,10 @@ int main(int argc, const char *argv[])
     {
         x[i] = (rand() % 100) / (rand() % 100 + 1); // the number we use to divide cannot be 0, that'offset the reason of the +1
     }
+
+    check_call(cudaMemcpy(d_x_old, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
+    check_call(cudaMemcpy(d_x_new, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    memcpy(x_par, x, num_rows * sizeof(float));
 
     // Compute in sw
     start_cpu = get_time();
@@ -354,21 +374,17 @@ int main(int argc, const char *argv[])
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
 
     int *d_row_ptr, *d_col_ind;
-    float *d_values, *d_matrixDiagonal, *d_x;
-    int *d_x_flags;
+    float *d_values, *d_matrixDiagonal;
 
     check_call(cudaMalloc((void**)&d_row_ptr, (num_rows + 1) * sizeof(int)));
     check_call(cudaMalloc((void**)&d_col_ind, num_vals * sizeof(int)));
     check_call(cudaMalloc((void**)&d_values, num_vals * sizeof(float)));
     check_call(cudaMalloc((void**)&d_matrixDiagonal, num_rows * sizeof(float)));
-    check_call(cudaMalloc((void**)&d_x, num_rows * sizeof(float)));
-    check_call(cudaMalloc((void**)&d_x_flags, num_rows * sizeof(int)));
 
     check_call(cudaMemcpy(d_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
     check_call(cudaMemcpy(d_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(d_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice)); // Use the same random vector for the parallel version
 
     printf("CUDA setup ok.\n");
 
@@ -378,51 +394,81 @@ int main(int argc, const char *argv[])
 
     start_gpu = get_time();
     
-    int *colors = (int *)malloc(num_rows * sizeof(int));
-
-    //color_jpl(num_rows, d_row_ptr, d_col_ind, d_values, colors);
+    int *colors_fw = (int *)malloc(num_rows * sizeof(int));
+    int *colors_bw = (int *)malloc(num_rows * sizeof(int));
     
-    int *d_colors;
+    int *d_colors_fw, *d_colors_bw;
 
-    check_call(cudaMalloc((void **)&d_colors, num_rows * sizeof(int)));
+    check_call(cudaMalloc((void **)&d_colors_fw, num_rows * sizeof(int)));
+    check_call(cudaMalloc((void **)&d_colors_bw, num_rows * sizeof(int)));
 
-    my_color<<<num_blocks, threads_per_block>>>(num_rows, d_row_ptr, d_col_ind, d_colors);
+    my_color<<<num_blocks, threads_per_block>>>(num_rows, d_row_ptr, d_col_ind, d_colors_fw, d_colors_bw);
 
-    //check_call(cudaMemcpy(d_colors, colors, num_rows * sizeof(int), cudaMemcpyHostToDevice));
-    check_call(cudaMemcpy(colors, d_colors, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
+    check_call(cudaMemcpy(colors_fw, d_colors_fw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
+    check_call(cudaMemcpy(colors_bw, d_colors_bw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
+    /*
+    for (int i = 0; i < num_rows; ++i)
+    {
+        printf("%d ", colors[i]);
+        if (i % 20 == 0) printf("\n");
+    }
+    printf("\n");
+    */
 
-    int num_colors = 0;
-    int free_val = 0;
+    int num_colors_fw = 0;
+    int num_colors_bw = 0;
 
     for (int i = 0; i < num_rows; ++i)
     {
-        if (colors[i] >= free_val) num_colors++;
-        free_val++;
+        if (colors_fw[i] >= i) num_colors_fw++;
     }
-    printf("Old vs new iterations: %d %d\n", num_rows, num_colors);
+    for (int i = num_rows - 1; i > -1; i--)
+    {
+        if (colors_bw[i] <= i) num_colors_bw++;
+    }
+    printf("Old vs new iterations fw: %d %d\n", num_rows, num_colors_fw);
+    printf("Old vs new iterations bw: %d %d\n", num_rows, num_colors_bw);
 
-    num_blocks = (num_rows - num_colors + threads_per_block - 1) / threads_per_block;
-
+    int num_blocks_fw = (num_rows - num_colors_fw + threads_per_block - 1) / threads_per_block;
+    int num_blocks_bw = (num_rows - num_colors_bw + threads_per_block - 1) / threads_per_block;
+    
     for (int i = 0; i < num_rows; i++)
     {
-        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
+        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_fw, i);
+        check_kernel_call();
+        cudaDeviceSynchronize();
+        check_call(cudaMemcpy(&d_x_new[i], &d_x_old[i], sizeof(float), cudaMemcpyDeviceToDevice));
+        /*
+        check_call(cudaMemcpy(x_par, d_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int k = 0; k < num_rows; k++)
+        {
+            printf("%f ", x_par[k]);
+        }
+        printf("\n");
+        */
     }
-    /*
-    for (int i = num_colors - 1; i >= 0; i--)
+    for (int i = num_rows - 1; i >= 0; i--)
     {
-        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x, d_matrixDiagonal, d_colors, i);
+        symgs_csr_sw_colors<<<num_blocks, threads_per_block>>>(d_row_ptr, d_col_ind, d_values, num_rows, d_x_old, d_x_new, d_matrixDiagonal, d_colors_bw, i);
+        check_kernel_call();
+        cudaDeviceSynchronize();
+        check_call(cudaMemcpy(&d_x_new[i], &d_x_old[i], sizeof(float), cudaMemcpyDeviceToDevice));
+        /*
+        check_call(cudaMemcpy(x_par, d_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int k = 0; k < num_rows; k++)
+        {
+            printf("%f ", x_par[k]);
+        }
+        printf("\n");
+        */
     }
-    */
 
     end_gpu = get_time();
 
     // Print GPU time
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
-    check_call(cudaMemcpy(x_par, d_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
-
-    printf("x: %f %f %f %f %f\n", x[0], x[1], x[2], x[3], x[4]);
-    printf("x par: %f %f %f %f %f\n", x_par[0], x_par[1], x_par[2], x_par[3], x_par[4]);
+    check_call(cudaMemcpy(x_par, d_x_new, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Compare results
     float err = inf_err(x, x_par, num_rows);
@@ -443,12 +489,16 @@ int main(int argc, const char *argv[])
     free(matrixDiagonal);
     free(x);
     free(x_par);
-    free(colors);
+    free(colors_fw);
+    free(colors_bw);
     check_call(cudaFree(d_row_ptr));
     check_call(cudaFree(d_col_ind));
     check_call(cudaFree(d_values));
     check_call(cudaFree(d_matrixDiagonal));
-    check_call(cudaFree(d_x));
+    check_call(cudaFree(d_x_old));
+    check_call(cudaFree(d_x_new));
+    check_call(cudaFree(d_colors_fw));
+    check_call(cudaFree(d_colors_bw));
 
     return 0;
 }
