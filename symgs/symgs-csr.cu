@@ -218,7 +218,7 @@ __global__ void set_color_map(const int n, int *map, int *colors)
 
     for (int i = idx; i < n; i += gridDim.x * blockDim.x)
     {
-        if (map[colors[i]] == 0) map[colors[i]] = 1; 
+        if (map[colors[i]] == 0) map[colors[i]] = 1;
     }
 }
 
@@ -348,14 +348,14 @@ int main(int argc, const char *argv[])
 
     check_call(cudaMemcpy(colors_fw, d_colors_fw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
     check_call(cudaMemcpy(colors_bw, d_colors_bw, num_rows * sizeof(int), cudaMemcpyDeviceToHost));
-    /*
+    
     for (int i = 0; i < num_rows; ++i)
     {
-        printf("%d ", colors[i]);
+        printf("%d ", colors_bw[i]);
         if (i % 20 == 0) printf("\n");
     }
     printf("\n");
-    */
+    
 
     int num_colors_fw, num_colors_bw;
     int *d_num_colors_fw, *d_num_colors_bw;
@@ -389,7 +389,7 @@ int main(int argc, const char *argv[])
     set_color_map<<<num_blocks, threads_per_block>>>(num_rows, d_map_fw, d_colors_fw);
     check_kernel_call();
     cudaDeviceSynchronize();
-    set_color_map<<<num_blocks_bw, threads_per_block>>>(num_rows, d_map_bw, d_colors_bw);
+    set_color_map<<<num_blocks, threads_per_block>>>(num_rows, d_map_bw, d_colors_bw);
     check_kernel_call();
     cudaDeviceSynchronize();
 
@@ -445,6 +445,8 @@ int main(int argc, const char *argv[])
     free(x_par);
     free(colors_fw);
     free(colors_bw);
+    free(map_fw);
+    free(map_bw);
     check_call(cudaFree(d_row_ptr));
     check_call(cudaFree(d_col_ind));
     check_call(cudaFree(d_values));
@@ -455,10 +457,11 @@ int main(int argc, const char *argv[])
     check_call(cudaFree(d_colors_bw));
     check_call(cudaFree(d_num_colors_fw));
     check_call(cudaFree(d_num_colors_bw));
+    check_call(cudaFree(d_map_fw));
+    check_call(cudaFree(d_map_bw));
 
     return 0;
 }
 
 // CHECK IF THE MATRIX FITS INTO THE GPU
 // OPTIMIZE NUMBER OF ITERATIONS (NUM_COLORS INSTEAD OF NUM_ROWS)
-// USE A MAP TO CHECK IF A COLOR EXISTS (FW AND BW)
